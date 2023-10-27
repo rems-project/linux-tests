@@ -173,6 +173,20 @@ void kernel_region_share_hyp(int fd, struct kernel_region* reg)
     }
 }
 
+void kernel_region_unshare_hyp(int fd, struct kernel_region *reg) {
+    ulong nr_pages = (reg->size + PAGE_SIZE - 1) / PAGE_SIZE;
+    ulong pfn = reg->phys >> PAGE_SHIFT;
+    int ret;
+    for (int i = 0; i < nr_pages; ++i) {
+        unsigned long args[1] = {pfn + i};
+        ret = ioctl(
+            fd, HVC_PROXY_IOCTL(__KVM_HOST_SMCCC_FUNC___pkvm_host_unshare_hyp, 1),
+            args);
+        if (ret < 0)
+            err(1, "pkvm_proxy host_unshare_hyp failed");
+    }
+}
+
 volatile struct hprox_vcpu_fault_info* get_fault_info(int fd, struct kernel_region* vcpu) {
     int fault_info_offset;
     fault_info_offset =
@@ -198,30 +212,32 @@ volatile struct hprox_memcache* get_vcpu_memcache(int fd, struct kernel_region* 
 }
 
 // returns handle
-int init_vm(int fd) {
-    struct kernel_region skvm, hkvm, pgd, last_ran;
-    int skvm_created_vcpus_offset;
-    volatile int* skvm_created_vcpus;
+int init_vm(int fd, struct kernel_region* host_kvm) {
+    struct kernel_region hyp_kvm, pgd, last_ran;
+    int host_kvm_created_vcpus_offset;
+    volatile int* host_kvm_created_vcpus;
     int vm_handle;
 
-    skvm.size = ioctl(fd, HPROX_STRUCT_KVM_GET_SIZE, 0);
-    if (skvm.size < 0) err(1, "Can't get skvm size");
-    alloc_kernel_region(fd, &skvm);
-    kernel_region_mmap(fd, &skvm);
-    memset(skvm.mmap, 0, skvm.size);
-    kernel_region_share_hyp(fd, &skvm);
+    host_kvm->size = ioctl(fd, HPROX_STRUCT_KVM_GET_SIZE, 0);
+    if (host_kvm->size < 0) err(1, "Can't get host_kvm size");
+    alloc_kernel_region(fd, host_kvm);
+    kernel_region_mmap(fd, host_kvm);
+    memset(host_kvm->mmap, 0, host_kvm->size);
+    kernel_region_share_hyp(fd, host_kvm);
 
-    skvm_created_vcpus_offset = ioctl(fd, HPROX_STRUCT_KVM_GET_OFFSET, HPROX_CREATED_VCPUS);
-    if (skvm_created_vcpus_offset < 0)
-        err(1, "Can't get skvm created_vcpus offset");
-    skvm_created_vcpus = (int*)(skvm.mmap + skvm_created_vcpus_offset);
-    *skvm_created_vcpus = NUM_VCPU;
+    host_kvm_created_vcpus_offset = ioctl(fd, HPROX_STRUCT_KVM_GET_OFFSET, HPROX_CREATED_VCPUS);
+    if (host_kvm_created_vcpus_offset < 0)
+        err(1, "Can't get host_kvm created_vcpus offset");
+    host_kvm_created_vcpus =
+        (int*)(host_kvm->mmap + host_kvm_created_vcpus_offset);
+    *host_kvm_created_vcpus = NUM_VCPU;
 
-    hkvm.size = ioctl(fd, HPROX_HYP_VM_GET_SIZE, 0);
-    if (hkvm.size < 0) err(1, "Can't get hkvm size");
-    hkvm.size += NUM_VCPU * sizeof(void*);
-    alloc_kernel_region(fd, &hkvm);
-    printf("hkvm kernel address %lx and size %x\n", hkvm.kaddr, hkvm.size);
+    hyp_kvm.size = ioctl(fd, HPROX_HYP_VM_GET_SIZE, 0);
+    if (hyp_kvm.size < 0) err(1, "Can't get hyp_kvm size");
+    hyp_kvm.size += NUM_VCPU * sizeof(void*);
+    alloc_kernel_region(fd, &hyp_kvm);
+    printf("hyp_kvm kernel address %lx and size %x\n",
+           hyp_kvm.kaddr, hyp_kvm.size);
 
     pgd.size = ioctl(fd, HPROX_PGD_GET_SIZE, 0);
     if (pgd.size < 0) err(1, "Can't get pgd size");
@@ -230,10 +246,11 @@ int init_vm(int fd) {
 
     last_ran.size = MAX_NUM_CPU * sizeof(int);
     alloc_kernel_region(fd, &last_ran);
-    printf("last_ran kernel address %lx and size %x\n", last_ran.kaddr, last_ran.size);
+    printf("last_ran kernel address %lx and size %x\n",
+           last_ran.kaddr, last_ran.size);
 
     unsigned long args[4] = {
-        skvm.kaddr, hkvm.kaddr, pgd.kaddr, last_ran.kaddr
+        host_kvm->kaddr, hyp_kvm.kaddr, pgd.kaddr, last_ran.kaddr
     };
 
     vm_handle = ioctl(
@@ -290,7 +307,7 @@ int init_vcpu(int fd, int handle, int idx, struct kernel_region *host_vcpu)
     return ret;
 }
 
-int set_vcpu_dirty(int fd, struct kernel_region* vcpu){
+void set_vcpu_dirty(int fd, struct kernel_region* vcpu){
     int iflags_offset;
     volatile __u8* iflags;
     iflags_offset =
@@ -338,7 +355,7 @@ int put_vcpu(int fd) {
     return ret;
 }
 
-int teardown_vm(int fd, int handle) {
+int teardown_vm(int fd, int handle, struct kernel_region* vm) {
     int ret;
 
     unsigned long args[1] = {
@@ -350,10 +367,12 @@ int teardown_vm(int fd, int handle) {
                 args);
     if (ret < 0) err(1, "pkvm_proxy teardown_vm failed");
 
+    kernel_region_unshare_hyp(fd, vm);
+
     return ret;
 }
 
-int topup_hyp_memcache(int fd, volatile struct hprox_memcache* mc, unsigned long min_pages){
+void topup_hyp_memcache(int fd, volatile struct hprox_memcache* mc, unsigned long min_pages){
     while (mc->nr_pages < min_pages){
         printf("Adding a page to memcache\n");
         struct kernel_region page;
@@ -366,7 +385,7 @@ int topup_hyp_memcache(int fd, volatile struct hprox_memcache* mc, unsigned long
     }
 }
 
-int map_region_guest(int fd, struct kernel_region* vcpu, struct kernel_region* mem, ulong gphys){
+void map_region_guest(int fd, struct kernel_region* vcpu, struct kernel_region* mem, ulong gphys){
     int ret;
     for(ulong mapped_size =0; mapped_size < mem->size; mapped_size += PAGE_SIZE){
         topup_hyp_memcache(fd,get_vcpu_memcache(fd, vcpu), 5);
@@ -383,10 +402,11 @@ int map_region_guest(int fd, struct kernel_region* vcpu, struct kernel_region* m
 
 int main(int argc, char** argv)
 {
+    struct kernel_region vm;
     struct kernel_region vcpu;
     volatile struct hprox_vcpu_fault_info *fault_info;
-    volatile struct user_pt_regs* regs;
-    volatile struct hprox_memcache* vcpu_mc;
+    volatile struct user_pt_regs *regs;
+    volatile struct hprox_memcache *vcpu_mc;
     int fd, ret;
     int vm_handle;
 
@@ -398,11 +418,12 @@ int main(int argc, char** argv)
 
     // A single fd descriptor allows coverage collection on a single thread.
     fd = open("/sys/kernel/debug/pkvm_proxy", O_RDWR);
-    if (fd == -1) err(1, "pkvm_proxy open");
+    if (fd == -1)
+        err(1, "pkvm_proxy open");
 
     printf("Opened pkvm_proxy fd %d\n", fd);
 
-    vm_handle = init_vm(fd);
+    vm_handle = init_vm(fd, &vm);
     printf ("Initialized VM with handle %d\n", vm_handle);
 
     init_vcpu(fd, vm_handle, 0, &vcpu);
@@ -439,8 +460,10 @@ int main(int argc, char** argv)
     put_vcpu(fd);
     printf("Unloaded VCPU 0 \n");
 
-    teardown_vm(fd, vm_handle);
+    teardown_vm(fd, vm_handle, &vm);
     printf("Teared down VM \n");
+
+    kernel_region_unshare_hyp(fd, &vcpu);
 
     return 0;
 }
