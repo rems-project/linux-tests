@@ -17,6 +17,7 @@
 #include <sys/sysinfo.h>
 
 #define __USE_GNU
+#define _GNU_SOURCE
 #include <sched.h>
 
 // This file shows an example PKVM proxy use to boot a simple non-protected VM.
